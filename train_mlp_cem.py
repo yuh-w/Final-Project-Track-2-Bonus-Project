@@ -396,7 +396,7 @@ def main() -> None:
             step_lateral_errors = jnp.abs(next_track_obs_batch[:, 1])
             
             z_height = next_states.data.qpos[:, 2]
-            has_fallen = z_height < 0.23  
+            has_fallen = next_states.done.astype(bool) | (z_height < 0.23)
             boundary_violation = next_track_obs_batch[:, 2] < (BOUNDARY_SAFETY_MARGIN_M / HALF_WIDTH_M)
             terminal = has_fallen | boundary_violation
             next_alive_batch = alive_batch & ~terminal
