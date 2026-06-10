@@ -38,6 +38,7 @@ MAX_YAW_RATE_RADPS = 0.60
 EDGE_SLOWDOWN_MARGIN_NORM = 0.50
 MAX_COMMAND_DELTA = 0.15
 BOUNDARY_SAFETY_MARGIN_M = 0.05
+TOP_K_RESULTS = 3
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -51,6 +52,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-seconds", type=float, default=45.0, help="Simulation time window per evaluation.")
     parser.add_argument("--start-s-m", type=float, default=0.0, help="Official track progress used for training resets.")
     parser.add_argument("--hidden-dim", type=int, default=32, help="Hidden dimension layout size for the MLP.")
+    parser.add_argument("--teacher-init", dest="teacher_init", action="store_true", default=True,
+                        help="Warm-start CEM by distilling a hand-coded track teacher into the MLP.")
+    parser.add_argument("--no-teacher-init", dest="teacher_init", action="store_false",
+                        help="Disable teacher distillation and start CEM from the old hand-biased random center.")
+    parser.add_argument("--teacher-steps", type=int, default=1200, help="Adam steps for teacher distillation.")
+    parser.add_argument("--teacher-samples", type=int, default=8192, help="Synthetic teacher samples.")
+    parser.add_argument("--teacher-batch-size", type=int, default=512, help="Teacher distillation batch size.")
+    parser.add_argument("--teacher-lr", type=float, default=3e-3, help="Teacher distillation learning rate.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--force-cpu", action="store_true")
     return parser.parse_args()
@@ -72,6 +81,17 @@ def vector_to_weights(vec: np.ndarray, input_dim: int = 8, hidden_dim: int = 32,
     
     return {"w1": w1, "b1": b1, "w2": w2, "b2": b2}
 
+
+def weights_to_vector(weights: dict[str, np.ndarray]) -> np.ndarray:
+    return np.concatenate(
+        [
+            np.ravel(np.asarray(weights["w1"], dtype=np.float32)),
+            np.ravel(np.asarray(weights["b1"], dtype=np.float32)),
+            np.ravel(np.asarray(weights["w2"], dtype=np.float32)),
+            np.ravel(np.asarray(weights["b2"], dtype=np.float32)),
+        ]
+    ).astype(np.float32)
+
 # ==========================================
 # 1. PURE JAX HIGH-LEVEL PLANNER (Smooth Tanh Activation)
 # ==========================================
@@ -91,6 +111,15 @@ def jax_mlp_forward(weights: dict, obs: jnp.ndarray) -> jnp.ndarray:
     yaw = MAX_YAW_RATE_RADPS * jnp.tanh(out[2])
     
     return jnp.array([vx, vy, yaw])
+
+
+def jax_mlp_forward_batch(weights: dict[str, jnp.ndarray], obs_batch: jnp.ndarray) -> jnp.ndarray:
+    h1 = jnp.maximum(0.0, obs_batch @ weights["w1"] + weights["b1"])
+    out = h1 @ weights["w2"] + weights["b2"]
+    vx = 0.5 * MAX_STRAIGHT_SPEED_MPS * (jnp.tanh(out[:, 0]) + 1.0)
+    vy = MAX_LATERAL_SPEED_MPS * jnp.tanh(out[:, 1])
+    yaw = MAX_YAW_RATE_RADPS * jnp.tanh(out[:, 2])
+    return jnp.stack([vx, vy, yaw], axis=-1)
 
 # ==========================================
 # 2. PURE JAX TRACK MATH
@@ -188,6 +217,104 @@ def jax_get_curv_norm(s_val: jnp.ndarray) -> jnp.ndarray:
         (s_mod >= 2.0 * straight + turn_len) & (s_mod < TRACK_LENGTH_M)
     )
     return jnp.where(is_turn, 1.0, 0.0)
+
+
+def make_teacher_dataset(num_samples: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    s = rng.uniform(0.0, TRACK_LENGTH_M, size=num_samples).astype(np.float32)
+    lap = (s / TRACK_LENGTH_M).astype(np.float32)
+    lateral = rng.uniform(-0.85, 0.85, size=num_samples).astype(np.float32)
+    heading = rng.uniform(-0.9, 0.9, size=num_samples).astype(np.float32)
+    v_est = rng.uniform(0.0, MAX_STRAIGHT_SPEED_MPS, size=num_samples).astype(np.float32)
+
+    s_jax = jnp.asarray(s)
+    curvature = np.asarray(jax_get_curv_norm(s_jax), dtype=np.float32)
+    lookahead_c2 = np.asarray(jax_get_curv_norm(s_jax + 2.0), dtype=np.float32)
+    lookahead_c5 = np.asarray(jax_get_curv_norm(s_jax + 5.0), dtype=np.float32)
+    boundary_margin = (1.0 - np.abs(lateral)).astype(np.float32)
+
+    obs = np.stack(
+        [
+            lap,
+            lateral,
+            boundary_margin,
+            heading,
+            curvature,
+            v_est,
+            lookahead_c2,
+            lookahead_c5,
+        ],
+        axis=-1,
+    ).astype(np.float32)
+
+    turn_intensity = np.clip(np.maximum.reduce([curvature, lookahead_c2, lookahead_c5]), 0.0, 1.0)
+    speed_cap = (1.0 - turn_intensity) * MAX_STRAIGHT_SPEED_MPS + turn_intensity * MAX_CURVE_SPEED_MPS
+    heading_risk = np.minimum(np.abs(heading) / 1.0, 1.0)
+    lateral_risk = np.clip((np.abs(lateral) - 0.25) / 0.75, 0.0, 1.0)
+    edge_risk = np.clip((EDGE_SLOWDOWN_MARGIN_NORM - boundary_margin) / EDGE_SLOWDOWN_MARGIN_NORM, 0.0, 1.0)
+    speed_scale = np.clip(1.0 - 0.25 * heading_risk - 0.30 * lateral_risk - 0.30 * edge_risk, 0.35, 1.0)
+    vx = np.clip(speed_cap * speed_scale, 0.25, MAX_STRAIGHT_SPEED_MPS).astype(np.float32)
+
+    vy = np.clip(-0.75 * lateral, -MAX_LATERAL_SPEED_MPS, MAX_LATERAL_SPEED_MPS).astype(np.float32)
+    yaw_feedforward = np.clip(vx / max(TURN_RADIUS_M, 1e-6), 0.0, MAX_YAW_RATE_RADPS) * turn_intensity
+    yaw_feedback = 0.55 * heading - 0.08 * lateral
+    yaw = np.clip(yaw_feedforward + yaw_feedback, -MAX_YAW_RATE_RADPS, MAX_YAW_RATE_RADPS).astype(np.float32)
+    target = np.stack([vx, vy, yaw], axis=-1).astype(np.float32)
+    return obs, target
+
+
+def distill_teacher_to_vector(
+    *,
+    hidden_dim: int,
+    num_params: int,
+    seed: int,
+    steps: int,
+    samples: int,
+    batch_size: int,
+    learning_rate: float,
+) -> np.ndarray:
+    obs_np, target_np = make_teacher_dataset(samples, seed + 17)
+    obs = jnp.asarray(obs_np)
+    target = jnp.asarray(target_np)
+    rng = np.random.default_rng(seed + 23)
+    vec = rng.normal(0.0, 0.05, size=num_params).astype(np.float32)
+    weights = {key: jnp.asarray(value) for key, value in vector_to_weights(vec, hidden_dim=hidden_dim).items()}
+    m = {key: jnp.zeros_like(value) for key, value in weights.items()}
+    v = {key: jnp.zeros_like(value) for key, value in weights.items()}
+
+    command_scale = jnp.asarray(
+        [MAX_STRAIGHT_SPEED_MPS, MAX_LATERAL_SPEED_MPS, MAX_YAW_RATE_RADPS],
+        dtype=jnp.float32,
+    )
+
+    def loss_fn(inner_weights: dict[str, jnp.ndarray], batch_obs: jnp.ndarray, batch_target: jnp.ndarray) -> jnp.ndarray:
+        pred = jax_mlp_forward_batch(inner_weights, batch_obs)
+        err = (pred - batch_target) / command_scale
+        return jnp.mean(jnp.square(err))
+
+    value_and_grad = jax.jit(jax.value_and_grad(loss_fn))
+    beta1 = 0.9
+    beta2 = 0.999
+    eps = 1e-8
+    num_samples = int(obs.shape[0])
+    batch_size = min(max(1, int(batch_size)), num_samples)
+
+    for step in range(max(0, int(steps))):
+        batch_idx = rng.integers(0, num_samples, size=batch_size)
+        batch_obs = obs[batch_idx]
+        batch_target = target[batch_idx]
+        _, grads = value_and_grad(weights, batch_obs, batch_target)
+        t = step + 1
+        for key in weights:
+            m[key] = beta1 * m[key] + (1.0 - beta1) * grads[key]
+            v[key] = beta2 * v[key] + (1.0 - beta2) * jnp.square(grads[key])
+            m_hat = m[key] / (1.0 - beta1**t)
+            v_hat = v[key] / (1.0 - beta2**t)
+            weights[key] = weights[key] - learning_rate * m_hat / (jnp.sqrt(v_hat) + eps)
+
+    final_loss = float(loss_fn(weights, obs, target))
+    print(f"Teacher distillation warm start finished: loss={final_loss:.5f}", flush=True)
+    return weights_to_vector({key: np.asarray(value) for key, value in weights.items()})
 
 
 def jax_apply_stability_envelope(
@@ -435,19 +562,81 @@ def main() -> None:
 
     print("Environment loaded and compiled! Starting VMAP CEM Optimization...\n")
 
-    mu = np.zeros(num_params, dtype=np.float32)
-    mu[-3] = 1.0  # Encourage initial forward movement velocity maps
-    sigma = np.ones(num_params, dtype=np.float32) * 0.5
+    if args.teacher_init:
+        print(
+            f"Distilling teacher planner into MLP warm start "
+            f"({args.teacher_steps} steps, {args.teacher_samples} samples)...",
+            flush=True,
+        )
+        mu = distill_teacher_to_vector(
+            hidden_dim=hidden_dim,
+            num_params=num_params,
+            seed=args.seed,
+            steps=args.teacher_steps,
+            samples=args.teacher_samples,
+            batch_size=args.teacher_batch_size,
+            learning_rate=args.teacher_lr,
+        )
+        sigma = np.ones(num_params, dtype=np.float32) * 0.30
+    else:
+        mu = np.zeros(num_params, dtype=np.float32)
+        mu[-3] = 1.0  # Encourage initial forward movement velocity maps
+        sigma = np.ones(num_params, dtype=np.float32) * 0.5
     best_score = -100.0
     history = []
+    top_results = []
     num_elites = max(1, int(args.population * args.elite_frac))
+
+    def build_config_payload(weights_path: str) -> dict[str, Any]:
+        return {
+            "planner_type": "learned_mlp",
+            "weights_path": weights_path,
+            "stand_seconds": 1.0,
+            "hidden_dim": hidden_dim,
+            "command_filter_alpha": COMMAND_FILTER_ALPHA,
+            "max_straight_speed_mps": MAX_STRAIGHT_SPEED_MPS,
+            "max_curve_speed_mps": MAX_CURVE_SPEED_MPS,
+            "max_lateral_speed_mps": MAX_LATERAL_SPEED_MPS,
+            "max_yaw_rate_radps": MAX_YAW_RATE_RADPS,
+            "edge_slowdown_margin_norm": EDGE_SLOWDOWN_MARGIN_NORM,
+            "max_command_delta": MAX_COMMAND_DELTA,
+            "boundary_safety_margin_m": BOUNDARY_SAFETY_MARGIN_M,
+            "teacher_init": bool(args.teacher_init),
+            "teacher_steps": int(args.teacher_steps),
+            "teacher_samples": int(args.teacher_samples),
+        }
+
+    def score_payload(record: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in record.items() if key != "candidate_vector"}
+
+    def save_top_results() -> None:
+        top_dir = args.output_dir / "top_results"
+        top_dir.mkdir(parents=True, exist_ok=True)
+        summary = []
+        for rank, record in enumerate(top_results, start=1):
+            weights_name = f"top_{rank}_planner_weights.npz"
+            config_name = f"top_{rank}_planner_config.json"
+            score_name = f"top_{rank}_score.json"
+            weights = vector_to_weights(record["candidate_vector"], hidden_dim=hidden_dim)
+            np.savez(top_dir / weights_name, **weights)
+            (top_dir / config_name).write_text(
+                json.dumps(build_config_payload(weights_name), indent=2)
+            )
+            payload = score_payload(record) | {
+                "rank": rank,
+                "weights_path": str(top_dir / weights_name),
+                "planner_config": str(top_dir / config_name),
+            }
+            (top_dir / score_name).write_text(json.dumps(payload, indent=2))
+            summary.append(payload | {"score_path": str(top_dir / score_name)})
+        (top_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
     for iteration in range(args.iterations):
         t0 = time.time()
         
         candidates = []
         for i in range(args.population):
-            if i == 0 and iteration > 0:
+            if i == 0:
                 candidates.append(mu.copy())
             else:
                 candidates.append(mu + rng_np.normal(0.0, sigma))
@@ -504,6 +693,7 @@ def main() -> None:
         scores = np.array(scores)
         lap_completion_np = np.array(lap_completion)
         mean_progress_speed_np = np.array(mean_progress_speed)
+        speed_score_np = np.array(speed_score)
         recent_speed_np = np.array(recent_speed)
         fell_np = np.array(fell)
         boundary_hit_np = np.array(boundary_hit)
@@ -511,38 +701,35 @@ def main() -> None:
         # Save Best Candidate and Metadata
         best_idx = int(np.argmax(scores))
         gen_best_score = scores[best_idx]
+        gen_best_record = {
+            "score": float(gen_best_score),
+            "iteration": iteration,
+            "candidate": best_idx,
+            "lap_completion": float(lap_completion_np[best_idx]),
+            "mean_progress_speed": float(mean_progress_speed_np[best_idx]),
+            "mean_speed_score": float(speed_score_np[best_idx]),
+            "recent_speed": float(recent_speed_np[best_idx]),
+            "fall": bool(fell_np[best_idx]),
+            "boundary_violation": bool(boundary_hit_np[best_idx]),
+            "candidate_vector": candidates[best_idx].copy(),
+        }
+
+        top_results.append(gen_best_record)
+        top_results.sort(key=lambda record: record["score"], reverse=True)
+        top_results = top_results[:TOP_K_RESULTS]
+        save_top_results()
         
         if gen_best_score > best_score:
             best_score = gen_best_score
             best_weights = vector_to_weights(candidates[best_idx], hidden_dim=hidden_dim)
             np.savez(args.output_dir / "planner_weights.npz", **best_weights)
             
-            config_payload = {
-                "planner_type": "learned_mlp", 
-                "weights_path": "planner_weights.npz", 
-                "stand_seconds": 1.0,
-                "hidden_dim": hidden_dim,
-                "command_filter_alpha": COMMAND_FILTER_ALPHA,
-                "max_straight_speed_mps": MAX_STRAIGHT_SPEED_MPS,
-                "max_curve_speed_mps": MAX_CURVE_SPEED_MPS,
-                "max_lateral_speed_mps": MAX_LATERAL_SPEED_MPS,
-                "max_yaw_rate_radps": MAX_YAW_RATE_RADPS,
-                "edge_slowdown_margin_norm": EDGE_SLOWDOWN_MARGIN_NORM,
-                "max_command_delta": MAX_COMMAND_DELTA,
-                "boundary_safety_margin_m": BOUNDARY_SAFETY_MARGIN_M
-            }
+            config_payload = build_config_payload("planner_weights.npz")
             (args.output_dir / "planner_config.json").write_text(json.dumps(config_payload, indent=2))
             
-            (args.output_dir / "best_score.json").write_text(json.dumps({
-                "score": float(best_score),
-                "iteration": iteration,
-                "candidate": best_idx,
-                "lap_completion": float(lap_completion_np[best_idx]),
-                "mean_progress_speed": float(mean_progress_speed_np[best_idx]),
-                "recent_speed": float(recent_speed_np[best_idx]),
-                "fall": bool(fell_np[best_idx]),
-                "boundary_violation": bool(boundary_hit_np[best_idx]),
-            }, indent=2))
+            (args.output_dir / "best_score.json").write_text(
+                json.dumps(score_payload(gen_best_record), indent=2)
+            )
 
         # Fit next generation distributions
         sorted_indices = np.argsort(scores)[::-1]
@@ -557,6 +744,7 @@ def main() -> None:
             f"Best Global: {best_score:.3f} | "
             f"Lap: {100.0 * lap_completion_np[best_idx]:.1f}% | "
             f"Mean Speed: {mean_progress_speed_np[best_idx]:.2f} m/s | "
+            f"Speed Score: {speed_score_np[best_idx]:.3f} | "
             f"Recent Speed: {recent_speed_np[best_idx]:.2f} m/s | "
             f"Fall: {bool(fell_np[best_idx])} | Boundary: {bool(boundary_hit_np[best_idx])} | "
             f"Step Time: {dt:.3f}s"
@@ -569,6 +757,7 @@ def main() -> None:
             "best_global": float(best_score),
             "best_lap_completion": float(lap_completion_np[best_idx]),
             "best_mean_progress_speed": float(mean_progress_speed_np[best_idx]),
+            "best_mean_speed_score": float(speed_score_np[best_idx]),
             "best_recent_speed": float(recent_speed_np[best_idx]),
             "best_fall": bool(fell_np[best_idx]),
             "best_boundary_violation": bool(boundary_hit_np[best_idx]),
