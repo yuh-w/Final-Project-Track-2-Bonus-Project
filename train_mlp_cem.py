@@ -38,13 +38,13 @@ MAX_YAW_RATE_RADPS = 0.65
 EDGE_SLOWDOWN_MARGIN_NORM = 0.45
 MAX_COMMAND_DELTA = 0.15
 BOUNDARY_SAFETY_MARGIN_M = 0.05
-TOP_K_RESULTS = 3
+TOP_K_RESULTS = 2
 SPEED_SCORE_BAD_MPS = 2.2
 SPEED_SCORE_GOOD_MPS = 3.6
-COMPLETION_WEIGHT = 40.0
-SPEED_WEIGHT = 30.0
-LINE_WEIGHT = 12.0
-STABILITY_WEIGHT = 18.0
+COMPLETION_WEIGHT = 30.0
+SPEED_WEIGHT = 40.0
+LINE_WEIGHT = 10.0
+STABILITY_WEIGHT = 20.0
 FALL_SCORE_MULTIPLIER = 0.25
 BOUNDARY_SCORE_MULTIPLIER = 0.45
 
@@ -84,6 +84,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stability-weight", type=float, default=STABILITY_WEIGHT)
     parser.add_argument("--fall-score-multiplier", type=float, default=FALL_SCORE_MULTIPLIER)
     parser.add_argument("--boundary-score-multiplier", type=float, default=BOUNDARY_SCORE_MULTIPLIER)
+    parser.add_argument("--top-k-results", type=int, default=TOP_K_RESULTS, help="Number of generation-best planners to archive.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--force-cpu", action="store_true")
     return parser.parse_args()
@@ -550,12 +551,15 @@ def main() -> None:
         track_length = 200.0
 
         def scan_step(carry, step_idx):
-            current_states, prev_s, cum_dist, prev_real_s_batch, last_cmd_batch, alive_batch = carry
+            current_states, prev_s, cum_dist, prev_real_s_batch, last_cmd_batch, alive_batch, rng_keys = carry
             
             is_standing = (step_idx * ctrl_dt) < 1.0
+            split_keys = jax.vmap(jax.random.split)(rng_keys)
+            action_keys = split_keys[:, 0]
+            next_rng_keys = split_keys[:, 1]
             
             next_states, next_track_obs_batch, current_real_s, next_cmd_batch = batch_robot_step(
-                current_states, batch_weights, batch_keys, is_standing, prev_real_s_batch, last_cmd_batch
+                current_states, batch_weights, action_keys, is_standing, prev_real_s_batch, last_cmd_batch
             )
             
             s_next = next_track_obs_batch[:, 0] * track_length
@@ -580,6 +584,7 @@ def main() -> None:
                 current_real_s,
                 next_cmd_batch,
                 next_alive_batch,
+                next_rng_keys,
             ), (next_cum_dist, delta_s, step_lateral_errors, has_fallen, boundary_violation, next_alive_batch)
 
         # Initialize trackers
@@ -589,7 +594,7 @@ def main() -> None:
         init_cmd = jnp.zeros((args.population, 3))
         init_alive = jnp.ones(args.population, dtype=bool)
         
-        init_carry = (initial_states_batch, init_s, init_cum_dist, init_s, init_cmd, init_alive)
+        init_carry = (initial_states_batch, init_s, init_cum_dist, init_s, init_cmd, init_alive, batch_keys)
         
         _, (
             all_cum_dists,
@@ -654,6 +659,7 @@ def main() -> None:
             "stability_weight": float(args.stability_weight),
             "fall_score_multiplier": float(args.fall_score_multiplier),
             "boundary_score_multiplier": float(args.boundary_score_multiplier),
+            "top_k_results": int(args.top_k_results),
             "teacher_init": bool(args.teacher_init),
             "teacher_steps": int(args.teacher_steps),
             "teacher_samples": int(args.teacher_samples),
@@ -701,9 +707,10 @@ def main() -> None:
             'b2': jnp.stack([vector_to_weights(c, hidden_dim=hidden_dim)['b2'] for c in candidates]),
         }
 
-        main_rng, reset_rng = jax.random.split(main_rng)
-        batch_keys = jax.random.split(reset_rng, args.population)
-        initial_states_batch = jax.vmap(reset_lowlevel_on_track)(batch_keys)
+        main_rng, reset_rng, action_rng = jax.random.split(main_rng, 3)
+        reset_keys = jax.random.split(reset_rng, args.population)
+        batch_keys = jax.random.split(action_rng, args.population)
+        initial_states_batch = jax.vmap(reset_lowlevel_on_track)(reset_keys)
 
         (
             all_cum_dists,
@@ -790,7 +797,7 @@ def main() -> None:
 
         top_results.append(gen_best_record)
         top_results.sort(key=lambda record: record["score"], reverse=True)
-        top_results = top_results[:TOP_K_RESULTS]
+        top_results = top_results[: max(1, int(args.top_k_results))]
         save_top_results()
         
         if gen_best_score > best_score:
