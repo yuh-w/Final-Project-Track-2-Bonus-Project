@@ -34,11 +34,19 @@ STRAIGHT_LENGTH_M = (TRACK_LENGTH_M - 2.0 * np.pi * TURN_RADIUS_M) / 2.0
 MAX_STRAIGHT_SPEED_MPS = 5.0
 MAX_CURVE_SPEED_MPS = 3.0
 MAX_LATERAL_SPEED_MPS = 0.25
-MAX_YAW_RATE_RADPS = 0.60
-EDGE_SLOWDOWN_MARGIN_NORM = 0.50
+MAX_YAW_RATE_RADPS = 0.65
+EDGE_SLOWDOWN_MARGIN_NORM = 0.45
 MAX_COMMAND_DELTA = 0.15
 BOUNDARY_SAFETY_MARGIN_M = 0.05
 TOP_K_RESULTS = 3
+SPEED_SCORE_BAD_MPS = 2.2
+SPEED_SCORE_GOOD_MPS = 3.6
+COMPLETION_WEIGHT = 40.0
+SPEED_WEIGHT = 30.0
+LINE_WEIGHT = 12.0
+STABILITY_WEIGHT = 18.0
+FALL_SCORE_MULTIPLIER = 0.25
+BOUNDARY_SCORE_MULTIPLIER = 0.45
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -60,9 +68,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-samples", type=int, default=8192, help="Synthetic teacher samples.")
     parser.add_argument("--teacher-batch-size", type=int, default=512, help="Teacher distillation batch size.")
     parser.add_argument("--teacher-lr", type=float, default=3e-3, help="Teacher distillation learning rate.")
+    parser.add_argument("--command-filter-alpha", type=float, default=COMMAND_FILTER_ALPHA)
+    parser.add_argument("--max-straight-speed-mps", type=float, default=MAX_STRAIGHT_SPEED_MPS)
+    parser.add_argument("--max-curve-speed-mps", type=float, default=MAX_CURVE_SPEED_MPS)
+    parser.add_argument("--max-lateral-speed-mps", type=float, default=MAX_LATERAL_SPEED_MPS)
+    parser.add_argument("--max-yaw-rate-radps", type=float, default=MAX_YAW_RATE_RADPS)
+    parser.add_argument("--edge-slowdown-margin-norm", type=float, default=EDGE_SLOWDOWN_MARGIN_NORM)
+    parser.add_argument("--max-command-delta", type=float, default=MAX_COMMAND_DELTA)
+    parser.add_argument("--boundary-safety-margin-m", type=float, default=BOUNDARY_SAFETY_MARGIN_M)
+    parser.add_argument("--speed-score-bad-mps", type=float, default=SPEED_SCORE_BAD_MPS)
+    parser.add_argument("--speed-score-good-mps", type=float, default=SPEED_SCORE_GOOD_MPS)
+    parser.add_argument("--completion-weight", type=float, default=COMPLETION_WEIGHT)
+    parser.add_argument("--speed-weight", type=float, default=SPEED_WEIGHT)
+    parser.add_argument("--line-weight", type=float, default=LINE_WEIGHT)
+    parser.add_argument("--stability-weight", type=float, default=STABILITY_WEIGHT)
+    parser.add_argument("--fall-score-multiplier", type=float, default=FALL_SCORE_MULTIPLIER)
+    parser.add_argument("--boundary-score-multiplier", type=float, default=BOUNDARY_SCORE_MULTIPLIER)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--force-cpu", action="store_true")
     return parser.parse_args()
+
+
+def apply_runtime_overrides(args: argparse.Namespace) -> None:
+    global COMMAND_FILTER_ALPHA
+    global MAX_STRAIGHT_SPEED_MPS
+    global MAX_CURVE_SPEED_MPS
+    global MAX_LATERAL_SPEED_MPS
+    global MAX_YAW_RATE_RADPS
+    global EDGE_SLOWDOWN_MARGIN_NORM
+    global MAX_COMMAND_DELTA
+    global BOUNDARY_SAFETY_MARGIN_M
+
+    COMMAND_FILTER_ALPHA = float(args.command_filter_alpha)
+    MAX_STRAIGHT_SPEED_MPS = float(args.max_straight_speed_mps)
+    MAX_CURVE_SPEED_MPS = float(args.max_curve_speed_mps)
+    MAX_LATERAL_SPEED_MPS = float(args.max_lateral_speed_mps)
+    MAX_YAW_RATE_RADPS = float(args.max_yaw_rate_radps)
+    EDGE_SLOWDOWN_MARGIN_NORM = float(args.edge_slowdown_margin_norm)
+    MAX_COMMAND_DELTA = float(args.max_command_delta)
+    BOUNDARY_SAFETY_MARGIN_M = float(args.boundary_safety_margin_m)
 
 def vector_to_weights(vec: np.ndarray, input_dim: int = 8, hidden_dim: int = 32, output_dim: int = 3) -> dict[str, np.ndarray]:
     w1_size = input_dim * hidden_dim
@@ -357,6 +401,7 @@ def jax_apply_stability_envelope(
 # ==========================================
 def main() -> None:
     args = parse_args()
+    apply_runtime_overrides(args)
     rng_np = np.random.default_rng(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -601,6 +646,14 @@ def main() -> None:
             "edge_slowdown_margin_norm": EDGE_SLOWDOWN_MARGIN_NORM,
             "max_command_delta": MAX_COMMAND_DELTA,
             "boundary_safety_margin_m": BOUNDARY_SAFETY_MARGIN_M,
+            "speed_score_bad_mps": float(args.speed_score_bad_mps),
+            "speed_score_good_mps": float(args.speed_score_good_mps),
+            "completion_weight": float(args.completion_weight),
+            "speed_weight": float(args.speed_weight),
+            "line_weight": float(args.line_weight),
+            "stability_weight": float(args.stability_weight),
+            "fall_score_multiplier": float(args.fall_score_multiplier),
+            "boundary_score_multiplier": float(args.boundary_score_multiplier),
             "teacher_init": bool(args.teacher_init),
             "teacher_steps": int(args.teacher_steps),
             "teacher_samples": int(args.teacher_samples),
@@ -666,8 +719,16 @@ def main() -> None:
         track_length = 200.0
         final_unwrapped_lap = all_cum_dists[-1] / track_length
         lap_completion = jnp.clip(final_unwrapped_lap, 0.0, 1.0)
-        total_time = num_steps * ctrl_dt
-        mean_progress_speed = jnp.clip(all_cum_dists[-1], 0.0, track_length) / total_time
+        completed_by_step = all_cum_dists >= track_length
+        completed = jnp.any(completed_by_step, axis=0)
+        finish_step = jnp.argmax(completed_by_step, axis=0)
+        terminal_by_step = ~all_alive
+        terminal = jnp.any(terminal_by_step, axis=0)
+        terminal_step = jnp.argmax(terminal_by_step, axis=0)
+        elapsed_steps = jnp.where(completed, finish_step + 1, jnp.where(terminal, terminal_step + 1, num_steps))
+        elapsed_time = jnp.maximum(elapsed_steps.astype(jnp.float32) * ctrl_dt, ctrl_dt)
+        mean_progress_speed = jnp.clip(all_cum_dists[-1], 0.0, track_length) / elapsed_time
+        finish_time = jnp.where(completed, (finish_step + 1).astype(jnp.float32) * ctrl_dt, jnp.inf)
 
         lateral_m = jnp.abs(all_lateral_errors) * HALF_WIDTH_M
         rms_lateral_m = jnp.sqrt(jnp.mean(jnp.square(lateral_m), axis=0))
@@ -675,7 +736,12 @@ def main() -> None:
         line_score = 0.5 * jnp.clip((1.5 - rms_lateral_m) / (1.5 - 0.25), 0.0, 1.0)
         line_score += 0.5 * jnp.clip(((HALF_WIDTH_M - BOUNDARY_SAFETY_MARGIN_M) - max_lateral_m) / ((HALF_WIDTH_M - BOUNDARY_SAFETY_MARGIN_M) - 0.75), 0.0, 1.0)
 
-        speed_score = jnp.clip((mean_progress_speed - 0.15) / (0.9 - 0.15), 0.0, 1.0)
+        speed_score_range = max(float(args.speed_score_good_mps) - float(args.speed_score_bad_mps), 1e-6)
+        speed_score = jnp.clip(
+            (mean_progress_speed - float(args.speed_score_bad_mps)) / speed_score_range,
+            0.0,
+            1.0,
+        )
         fell = jnp.any(all_has_fallen, axis=0)
         boundary_hit = jnp.any(all_boundary_violations, axis=0)
         stability_score = jnp.ones_like(lap_completion)
@@ -686,14 +752,21 @@ def main() -> None:
         recent_speed = jnp.sum(all_step_dists[-recent_window:], axis=0) / (recent_window * ctrl_dt)
         stall_penalty = jnp.where((lap_completion < 0.98) & (recent_speed < 0.05), 20.0, 0.0)
 
-        scores = 45.0 * lap_completion + 20.0 * speed_score + 20.0 * line_score + 10.0 * stability_score
-        scores = jnp.where(fell | boundary_hit, scores * 0.55, scores)
+        scores = (
+            float(args.completion_weight) * lap_completion
+            + float(args.speed_weight) * speed_score
+            + float(args.line_weight) * line_score
+            + float(args.stability_weight) * stability_score
+        )
+        scores = jnp.where(fell, scores * float(args.fall_score_multiplier), scores)
+        scores = jnp.where(boundary_hit, scores * float(args.boundary_score_multiplier), scores)
         scores = scores - stall_penalty
 
         scores = np.array(scores)
         lap_completion_np = np.array(lap_completion)
         mean_progress_speed_np = np.array(mean_progress_speed)
         speed_score_np = np.array(speed_score)
+        finish_time_np = np.array(finish_time)
         recent_speed_np = np.array(recent_speed)
         fell_np = np.array(fell)
         boundary_hit_np = np.array(boundary_hit)
@@ -706,6 +779,7 @@ def main() -> None:
             "iteration": iteration,
             "candidate": best_idx,
             "lap_completion": float(lap_completion_np[best_idx]),
+            "finish_time": None if not np.isfinite(finish_time_np[best_idx]) else float(finish_time_np[best_idx]),
             "mean_progress_speed": float(mean_progress_speed_np[best_idx]),
             "mean_speed_score": float(speed_score_np[best_idx]),
             "recent_speed": float(recent_speed_np[best_idx]),
@@ -743,6 +817,7 @@ def main() -> None:
             f"[Gen {iteration:02d}] Best Gen Score: {gen_best_score:.3f} | "
             f"Best Global: {best_score:.3f} | "
             f"Lap: {100.0 * lap_completion_np[best_idx]:.1f}% | "
+            f"Finish: {'DNF' if not np.isfinite(finish_time_np[best_idx]) else f'{finish_time_np[best_idx]:.2f}s'} | "
             f"Mean Speed: {mean_progress_speed_np[best_idx]:.2f} m/s | "
             f"Speed Score: {speed_score_np[best_idx]:.3f} | "
             f"Recent Speed: {recent_speed_np[best_idx]:.2f} m/s | "
@@ -756,6 +831,7 @@ def main() -> None:
             "max_score": float(np.max(scores)),
             "best_global": float(best_score),
             "best_lap_completion": float(lap_completion_np[best_idx]),
+            "best_finish_time": None if not np.isfinite(finish_time_np[best_idx]) else float(finish_time_np[best_idx]),
             "best_mean_progress_speed": float(mean_progress_speed_np[best_idx]),
             "best_mean_speed_score": float(speed_score_np[best_idx]),
             "best_recent_speed": float(recent_speed_np[best_idx]),
